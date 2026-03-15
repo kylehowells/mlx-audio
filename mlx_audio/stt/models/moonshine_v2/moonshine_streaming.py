@@ -100,7 +100,8 @@ class Attention(nn.Module):
         cache: Optional[Tuple[mx.array, mx.array]] = None,
         position_ids: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
-    ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
+        return_weights: bool = False,
+    ) -> Tuple[mx.array, Tuple[mx.array, mx.array], Optional[mx.array]]:
         B, T, _ = x.shape
         is_cross = encoder_hidden_states is not None
 
@@ -140,9 +141,17 @@ class Attention(nn.Module):
                 causal = mx.concatenate([prefix, causal], axis=1)
             attn_mask = causal if attn_mask is None else attn_mask + causal
 
-        o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attn_mask)
+        qk = None
+        if return_weights and is_cross:
+            # Compute attention weights explicitly so we can return them
+            qk = (q @ k.transpose(0, 1, 3, 2)) * self.scale  # [B, H, T, S]
+            w = mx.softmax(qk, axis=-1)
+            o = w @ v
+        else:
+            o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attn_mask)
+
         o = o.transpose(0, 2, 1, 3).reshape(B, T, -1)
-        return self.o_proj(o), (k, v)
+        return self.o_proj(o), (k, v), qk
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +236,7 @@ class EncoderLayer(nn.Module):
         mask = self._sliding_mask(x.shape[1])
         r = x
         x = self.input_layernorm(x)
-        x, _ = self.self_attn(x, mask=mask)
+        x, _, _ = self.self_attn(x, mask=mask)
         x = r + x
         r = x
         x = self.post_attention_layernorm(x)
@@ -256,21 +265,24 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.LayerNorm(d, bias=False)
         self.final_layernorm = nn.LayerNorm(d, bias=False)
 
-    def __call__(self, x, memory, self_cache=None, cross_cache=None):
+    def __call__(self, x, memory, self_cache=None, cross_cache=None, return_cross_weights=False):
         r = x
         x = self.input_layernorm(x)
-        x, new_self = self.self_attn(x, cache=self_cache)
+        x, new_self, _ = self.self_attn(x, cache=self_cache)
         x = r + x
 
         r = x
         x = self.post_attention_layernorm(x)
-        x, new_cross = self.encoder_attn(x, encoder_hidden_states=memory, cache=cross_cache)
+        x, new_cross, cross_qk = self.encoder_attn(
+            x, encoder_hidden_states=memory, cache=cross_cache,
+            return_weights=return_cross_weights,
+        )
         x = r + x
 
         r = x
         x = self.final_layernorm(x)
         x = self.mlp(x)
-        return r + x, new_self, new_cross
+        return r + x, new_self, new_cross, cross_qk
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +454,22 @@ class Decoder(nn.Module):
             x = self.proj(x)
         return x
 
-    def __call__(self, tokens, memory, cache=None):
+    def __call__(self, tokens, memory, cache=None, return_cross_qk=False):
         x = self.embed_tokens(tokens)
         if cache is None:
             cache = [{"self": None, "cross": None} for _ in self.layers]
         new_cache = []
+        cross_qk_all = [] if return_cross_qk else None
         for i, layer in enumerate(self.layers):
-            x, sc, cc = layer(x, memory, self_cache=cache[i]["self"], cross_cache=cache[i]["cross"])
+            x, sc, cc, layer_qk = layer(
+                x, memory,
+                self_cache=cache[i]["self"], cross_cache=cache[i]["cross"],
+                return_cross_weights=return_cross_qk,
+            )
             new_cache.append({"self": sc, "cross": cc})
-        return self.norm(x), new_cache
+            if return_cross_qk:
+                cross_qk_all.append(layer_qk)
+        return self.norm(x), new_cache, cross_qk_all
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +570,7 @@ class Model(nn.Module):
 
         # First token (sync to prime the cache)
         tok = mx.array([[tokens[-1]]], dtype=mx.int32)
-        hidden, cache = self.decoder(tok, memory, cache=cache)
+        hidden, cache, _ = self.decoder(tok, memory, cache=cache)
         logits = self._get_logits(hidden[:, -1, :])
         if temperature > 0:
             next_tok_arr = mx.random.categorical(logits / temperature)
@@ -565,7 +584,7 @@ class Model(nn.Module):
                 break
             tokens.append(nt)
             tok = mx.array([[nt]], dtype=mx.int32)
-            hidden, cache = self.decoder(tok, memory, cache=cache)
+            hidden, cache, _ = self.decoder(tok, memory, cache=cache)
             logits = self._get_logits(hidden[:, -1, :])
             if temperature > 0:
                 next_tok_arr = mx.random.categorical(logits / temperature)
@@ -593,6 +612,93 @@ class Model(nn.Module):
             prompt_tps=1 / elapsed if elapsed else 0,
             generation_tps=len(gen) / elapsed if elapsed else 0,
         )
+
+    # ===================================================================
+    #  Word-level timestamps
+    # ===================================================================
+
+    def generate_with_word_timestamps(
+        self, audio, *, max_tokens: int = 500,
+        dtype: mx.Dtype = mx.float32, time_offset: float = 0.0,
+        **kwargs,
+    ) -> Tuple[STTOutput, list]:
+        """
+        Transcribe audio and extract word-level timestamps via cross-attention DTW.
+
+        Returns (STTOutput, list[WordTiming]).
+        """
+        from .timing import find_alignment, WordTiming
+
+        for k in ("generation_stream", "language", "source_lang", "target_lang"):
+            kwargs.pop(k, None)
+        start = time.time()
+
+        if isinstance(audio, (str, Path)):
+            from mlx_audio.stt.utils import load_audio
+            audio = load_audio(str(audio), sr=self.sample_rate, dtype=dtype)
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
+        if audio.dtype != dtype:
+            audio = audio.astype(dtype)
+
+        # Encode (fused)
+        features = self.encoder.embedder(audio)
+        encoded = self.encoder(features)
+        memory = self.decoder.prepare_memory(encoded)
+        mx.eval(memory)
+
+        num_frames = memory.shape[1]
+        dur = audio.shape[-1] / self.sample_rate
+        max_tokens = min(max_tokens, int(math.ceil(dur * self.config.max_tokens_per_second)))
+        cfg = self.config
+
+        # Decode with per-step cross-attention weight extraction.
+        # Uses manual attention (not fused sdpa) for cross-attention only,
+        # since mx.fast.scaled_dot_product_attention doesn't return weights.
+        tokens = [cfg.decoder_start_token_id]
+        cache = None
+        cross_qk_per_step = []
+
+        for _ in range(max_tokens):
+            tok = mx.array([[tokens[-1]]], dtype=mx.int32)
+            hidden, cache, cross_qk = self.decoder(
+                tok, memory, cache=cache, return_cross_qk=True,
+            )
+            mx.eval(hidden)
+            if cross_qk is not None:
+                cross_qk_per_step.append(cross_qk)
+
+            logits = self._get_logits(hidden[:, -1, :])
+            nt = int(logits.argmax())
+            if nt == cfg.eos_token_id:
+                break
+            tokens.append(nt)
+
+        gen = tokens[1:]
+        text = self._decode_tokens(gen)
+        elapsed = time.time() - start
+
+        # Extract word timestamps
+        word_timings = find_alignment(
+            cross_qk_per_step, gen, self._tokenizer, num_frames,
+            time_offset=time_offset,
+        )
+
+        # Build segments with word-level detail
+        words = [
+            {"word": wt.word, "start": wt.start, "end": wt.end, "probability": wt.probability}
+            for wt in word_timings
+        ]
+
+        output = STTOutput(
+            text=text.strip(),
+            segments=[{"text": text.strip(), "start": 0.0, "end": dur, "words": words}],
+            prompt_tokens=1, generation_tokens=len(gen),
+            total_tokens=1 + len(gen), total_time=elapsed,
+            prompt_tps=1 / elapsed if elapsed else 0,
+            generation_tps=len(gen) / elapsed if elapsed else 0,
+        )
+        return output, word_timings
 
     # ===================================================================
     #  Streaming API
@@ -690,7 +796,7 @@ class Model(nn.Module):
 
         # First token (sync)
         tok = mx.array([[tokens[-1]]], dtype=mx.int32)
-        hidden, cache = self.decoder(tok, state.memory, cache=cache)
+        hidden, cache, _ = self.decoder(tok, state.memory, cache=cache)
         logits = self._get_logits(hidden[:, -1, :])
         if temperature > 0:
             next_tok_arr = mx.random.categorical(logits / temperature)
@@ -704,7 +810,7 @@ class Model(nn.Module):
                 break
             tokens.append(nt)
             tok = mx.array([[nt]], dtype=mx.int32)
-            hidden, cache = self.decoder(tok, state.memory, cache=cache)
+            hidden, cache, _ = self.decoder(tok, state.memory, cache=cache)
             logits = self._get_logits(hidden[:, -1, :])
             if temperature > 0:
                 next_tok_arr = mx.random.categorical(logits / temperature)
