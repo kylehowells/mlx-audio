@@ -4,19 +4,19 @@ Convert Moonshine Streaming models to MLX format with optional quantization.
 
 Usage:
     # Float16
-    python -m mlx_audio.stt.models.moonshine_v2.convert \
+    python -m mlx_audio.stt.models.moonshine_streaming.convert \
         --model UsefulSensors/moonshine-streaming-tiny \
         --dtype float16 \
         -o moonshine-streaming-tiny-fp16
 
     # 8-bit quantized
-    python -m mlx_audio.stt.models.moonshine_v2.convert \
+    python -m mlx_audio.stt.models.moonshine_streaming.convert \
         --model UsefulSensors/moonshine-streaming-tiny \
         --quantize --q-bits 8 \
         -o moonshine-streaming-tiny-8bit
 
     # 4-bit quantized
-    python -m mlx_audio.stt.models.moonshine_v2.convert \
+    python -m mlx_audio.stt.models.moonshine_streaming.convert \
         --model UsefulSensors/moonshine-streaming-tiny \
         --quantize --q-bits 4 \
         -o moonshine-streaming-tiny-4bit

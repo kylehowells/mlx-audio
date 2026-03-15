@@ -19,8 +19,7 @@ MODEL_REMAPPING = {
     "qwen3_asr": "qwen3_asr",
     "canary": "canary",
     "moonshine": "moonshine",
-    "moonshine_v2": "moonshine_v2",
-    "moonshine_streaming": "moonshine_v2",
+    "moonshine_streaming": "moonshine_streaming",
     "mms": "mms",
     "granite_speech": "granite_speech",
 }

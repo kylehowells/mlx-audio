@@ -298,7 +298,7 @@ VARIANTS = [
 # ---------------------------------------------------------------------------
 
 def load_model(model_path):
-    from mlx_audio.stt.models.moonshine_v2 import Model, ModelConfig
+    from mlx_audio.stt.models.moonshine_streaming import Model, ModelConfig
     from transformers import AutoTokenizer
 
     with open(os.path.join(model_path, 'config.json')) as f:

@@ -104,6 +104,38 @@ def compute_wer(reference: str, hypothesis: str) -> float:
     return d[len(ref_words)][len(hyp_words)] / len(ref_words)
 
 
+def compute_bleu(reference: str, hypothesis: str, max_n: int = 4) -> float:
+    """Corpus-level BLEU score (single reference)."""
+    ref_words = normalize_text(reference).split()
+    hyp_words = normalize_text(hypothesis).split()
+    if not ref_words or not hyp_words:
+        return 0.0
+
+    # Brevity penalty
+    bp = min(1.0, len(hyp_words) / len(ref_words))
+
+    # N-gram precisions
+    import math
+    log_avg = 0.0
+    for n in range(1, max_n + 1):
+        ref_ng = {}
+        for i in range(len(ref_words) - n + 1):
+            ng = tuple(ref_words[i:i + n])
+            ref_ng[ng] = ref_ng.get(ng, 0) + 1
+        hyp_ng = {}
+        for i in range(len(hyp_words) - n + 1):
+            ng = tuple(hyp_words[i:i + n])
+            hyp_ng[ng] = hyp_ng.get(ng, 0) + 1
+        clipped = sum(min(hyp_ng.get(ng, 0), c) for ng, c in ref_ng.items())
+        total = max(len(hyp_words) - n + 1, 1)
+        precision = clipped / total if total > 0 else 0.0
+        if precision == 0:
+            return 0.0
+        log_avg += math.log(precision) / max_n
+
+    return bp * math.exp(log_avg)
+
+
 def compute_chrf(reference: str, hypothesis: str, n: int = 6, beta: float = 2.0) -> float:
     ref_norm = normalize_text(reference)
     hyp_norm = normalize_text(hypothesis)
@@ -195,7 +227,7 @@ def discover_test_files() -> list:
 # ---------------------------------------------------------------------------
 
 def load_model(name, path, is_hf):
-    from mlx_audio.stt.models.moonshine_v2 import Model, ModelConfig
+    from mlx_audio.stt.models.moonshine_streaming import Model, ModelConfig
     from transformers import AutoTokenizer
 
     if is_hf:
@@ -353,6 +385,7 @@ def generate_charts(results):
             "size_mb": entries[0]["model_size_mb"],
             "avg_wer": np.mean([e["wer"] for e in entries]),
             "avg_chrf": np.mean([e["chrf"] for e in entries]),
+            "avg_bleu": np.mean([e.get("bleu", 0) for e in entries]),
             "avg_rtf": total_infer / total_audio if total_audio else 0,
             "avg_tps": np.mean([e["tokens_per_sec"] for e in entries]),
             "speed_x": total_audio / total_infer if total_infer else 0,
@@ -412,8 +445,8 @@ def generate_charts(results):
     fig.savefig(os.path.join(RESULTS_DIR, "speed_comparison.png"), dpi=150)
     plt.close()
 
-    # --- Chart 3: Quality metrics ---
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    # --- Chart 3: Quality metrics (WER + ChrF++ + BLEU) ---
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
     x = np.arange(len(models))
     width = 0.6
     ax1.bar(x, [agg[m]["avg_wer"] * 100 for m in models], width,
@@ -432,6 +465,14 @@ def generate_charts(results):
     ax2.set_ylabel("ChrF++ (%)")
     ax2.set_title("ChrF++ Score (higher = better)")
     ax2.grid(True, axis='y', alpha=0.3)
+    ax3.bar(x, [agg[m]["avg_bleu"] * 100 for m in models], width,
+            color=[colors[m] for m in models], edgecolor='black', linewidth=0.5)
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(models, rotation=45, ha='right', fontsize=9)
+    ax3.set_ylim(bottom=0)
+    ax3.set_ylabel("BLEU (%)")
+    ax3.set_title("BLEU Score (higher = better)")
+    ax3.grid(True, axis='y', alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(RESULTS_DIR, "quality_metrics.png"), dpi=150)
     plt.close()
@@ -490,12 +531,13 @@ def generate_charts(results):
     print(f"Charts saved to {RESULTS_DIR}/")
 
     # --- Summary table ---
-    print(f"\n{'Model':<16} {'Size':>7} {'Speed':>7} {'WER':>7} {'ChrF++':>7} {'Files':>6}")
-    print("=" * 55)
+    print(f"\n{'Model':<16} {'Size':>7} {'Speed':>7} {'WER':>7} {'ChrF++':>7} {'BLEU':>7} {'Files':>6}")
+    print("=" * 63)
     for m in models:
         a = agg[m]
         print(f"{m:<16} {a['size_mb']:>6.0f}M {a['speed_x']:>5.0f}x "
-              f"{a['avg_wer']*100:>6.1f}% {a['avg_chrf']*100:>6.1f}% {a['num_files']:>5}")
+              f"{a['avg_wer']*100:>6.1f}% {a['avg_chrf']*100:>6.1f}% "
+              f"{a['avg_bleu']*100:>6.1f}% {a['num_files']:>5}")
 
     return agg
 
