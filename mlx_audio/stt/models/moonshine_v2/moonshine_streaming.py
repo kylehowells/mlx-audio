@@ -535,11 +535,9 @@ class Model(nn.Module):
         if audio.dtype != dtype:
             audio = audio.astype(dtype)
 
-        # Encode
+        # Encode (fused: single eval for entire encode pipeline)
         features = self.encoder.embedder(audio)
-        mx.eval(features)
         encoded = self.encoder(features)
-        mx.eval(encoded)
         memory = self.decoder.prepare_memory(encoded)
         mx.eval(memory)
 
@@ -547,20 +545,37 @@ class Model(nn.Module):
         dur = audio.shape[-1] / self.sample_rate
         max_tokens = min(max_tokens, int(math.ceil(dur * self.config.max_tokens_per_second)))
 
-        # Decode
+        # Decode (async eval: pipeline GPU compute with Python)
         tokens = [self.config.decoder_start_token_id]
         cache = None
-        for _ in range(max_tokens):
-            tok = mx.array([[tokens[-1]]], dtype=mx.int32)
-            hidden, cache = self.decoder(tok, memory, cache=cache)
-            mx.eval(hidden)
-            logits = self._get_logits(hidden[:, -1, :])
-            if temperature > 0:
-                nt = int(mx.random.categorical(logits / temperature))
-            else:
-                nt = int(logits.argmax())
+
+        # First token (sync to prime the cache)
+        tok = mx.array([[tokens[-1]]], dtype=mx.int32)
+        hidden, cache = self.decoder(tok, memory, cache=cache)
+        logits = self._get_logits(hidden[:, -1, :])
+        if temperature > 0:
+            next_tok_arr = mx.random.categorical(logits / temperature)
+        else:
+            next_tok_arr = logits.argmax()
+        mx.eval(next_tok_arr)
+
+        for _ in range(max_tokens - 1):
+            nt = int(next_tok_arr)
             if nt == self.config.eos_token_id:
                 break
+            tokens.append(nt)
+            tok = mx.array([[nt]], dtype=mx.int32)
+            hidden, cache = self.decoder(tok, memory, cache=cache)
+            logits = self._get_logits(hidden[:, -1, :])
+            if temperature > 0:
+                next_tok_arr = mx.random.categorical(logits / temperature)
+            else:
+                next_tok_arr = logits.argmax()
+            mx.async_eval(next_tok_arr)
+
+        # Collect final token
+        nt = int(next_tok_arr)
+        if nt != self.config.eos_token_id:
             tokens.append(nt)
 
         gen = tokens[1:]
@@ -639,20 +654,16 @@ class Model(nn.Module):
                 return self._decode_memory(state, max_tokens, temperature), state
             return "", state
 
-        # Encoder: sliding window with left context
+        # Encoder: sliding window with left context (fused eval)
         left_ctx = 16 * ec.num_hidden_layers
         win_start = max(0, state.encoder_frames_emitted - left_ctx)
         window = state.accumulated_features[:, win_start:total, :]
 
         encoded = self.encoder(window)
-        mx.eval(encoded)
-
         offset = state.encoder_frames_emitted - win_start
         new_encoded = encoded[:, offset: offset + new_frames, :]
-
-        # Prepare memory (add pos_emb + project)
         new_memory = self.decoder.prepare_memory(new_encoded, pos_offset=state.pos_offset)
-        mx.eval(new_memory)
+        mx.eval(new_memory)  # single eval for encode + memory prep
 
         state.pos_offset += new_frames
         state.encoder_frames_emitted = stable
@@ -666,6 +677,7 @@ class Model(nn.Module):
         return self._decode_memory(state, max_tokens, temperature), state
 
     def _decode_memory(self, state: StreamingState, max_tokens: int, temperature: float) -> str:
+        """Auto-regressive decode with async eval pipelining."""
         cfg = self.config
         if state.memory is None or state.memory_len == 0:
             return ""
@@ -675,17 +687,33 @@ class Model(nn.Module):
 
         tokens = [cfg.decoder_start_token_id]
         cache = None  # fresh each decode pass
-        for _ in range(max_tokens):
-            tok = mx.array([[tokens[-1]]], dtype=mx.int32)
-            hidden, cache = self.decoder(tok, state.memory, cache=cache)
-            mx.eval(hidden)
-            logits = self._get_logits(hidden[:, -1, :])
-            if temperature > 0:
-                nt = int(mx.random.categorical(logits / temperature))
-            else:
-                nt = int(logits.argmax())
+
+        # First token (sync)
+        tok = mx.array([[tokens[-1]]], dtype=mx.int32)
+        hidden, cache = self.decoder(tok, state.memory, cache=cache)
+        logits = self._get_logits(hidden[:, -1, :])
+        if temperature > 0:
+            next_tok_arr = mx.random.categorical(logits / temperature)
+        else:
+            next_tok_arr = logits.argmax()
+        mx.eval(next_tok_arr)
+
+        for _ in range(max_tokens - 1):
+            nt = int(next_tok_arr)
             if nt == cfg.eos_token_id:
                 break
+            tokens.append(nt)
+            tok = mx.array([[nt]], dtype=mx.int32)
+            hidden, cache = self.decoder(tok, state.memory, cache=cache)
+            logits = self._get_logits(hidden[:, -1, :])
+            if temperature > 0:
+                next_tok_arr = mx.random.categorical(logits / temperature)
+            else:
+                next_tok_arr = logits.argmax()
+            mx.async_eval(next_tok_arr)
+
+        nt = int(next_tok_arr)
+        if nt != cfg.eos_token_id:
             tokens.append(nt)
         return self._decode_tokens(tokens[1:])
 
