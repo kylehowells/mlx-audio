@@ -93,6 +93,7 @@ def find_alignment(
     *,
     time_offset: float = 0.0,
     medfilt_width: int = 7,
+    token_probs: Optional[List[float]] = None,
 ) -> List[WordTiming]:
     """
     Build word-level timestamps from per-step cross-attention weights.
@@ -102,17 +103,18 @@ def find_alignment(
     cross_qk_per_step : list of list of mx.array
         Outer list: one entry per decode step.
         Inner list: one entry per decoder layer.
-        Each array: [B, num_heads, 1, cross_len] — the raw QK scores
-        from that layer's cross-attention for that decode step.
+        Each array: [B, num_heads, 1, cross_len] — the raw QK scores.
     tokens : list of int
-        The decoded token IDs (excluding BOS, including all generated tokens).
-    tokenizer : tokenizer with decode() method
+        The decoded token IDs (excluding BOS).
+    tokenizer : tokenizer with decode() and convert_ids_to_tokens()
     num_frames : int
         Number of encoder memory frames (= cross_len).
     time_offset : float
-        Time offset to add to all timestamps (e.g., for chunked processing).
+        Time offset to add to all timestamps.
     medfilt_width : int
         Width of median filter applied to attention weights.
+    token_probs : list of float, optional
+        Per-token generation probabilities from softmax(logits).
 
     Returns
     -------
@@ -125,18 +127,13 @@ def find_alignment(
     n_layers = len(cross_qk_per_step[0])
 
     # Build attention matrix: average across all layers and heads
-    # Shape per step per layer: [B, H, 1, cross_len] -> take [0, :, 0, :]
-    # Stack steps -> [n_steps, cross_len] (averaged over heads and layers)
     attn_rows = []
     for step_qks in cross_qk_per_step:
         step_weights = []
         for layer_qk in step_qks:
-            # layer_qk: [B, H, 1, cross_len]
-            # Apply softmax per head, then average heads
             w = mx.softmax(layer_qk[0, :, 0, :], axis=-1)  # [H, cross_len]
-            step_weights.append(w.mean(axis=0))  # [cross_len]
-        # Average across layers
-        attn_rows.append(mx.stack(step_weights).mean(axis=0))  # [cross_len]
+            step_weights.append(w.mean(axis=0))              # [cross_len]
+        attn_rows.append(mx.stack(step_weights).mean(axis=0))
 
     attn_matrix = mx.stack(attn_rows)  # [n_steps, cross_len]
     attn_np = np.array(attn_matrix.astype(mx.float32))
@@ -153,11 +150,11 @@ def find_alignment(
     # DTW on negative attention (DTW finds minimum-cost path)
     text_indices, time_indices = _dtw(-attn_np)
 
-    # Token probabilities (not available from cross-attn alone, use 1.0)
-    token_probs = [1.0] * len(tokens)
+    # Default token probs to 1.0 if not provided
+    if token_probs is None:
+        token_probs = [1.0] * len(tokens)
 
-    # Group tokens into words using sentencepiece markers
-    # The ▁ (U+2581) prefix on a token piece indicates a word boundary.
+    # Group tokens into words using sentencepiece markers (▁ = word boundary)
     pieces = tokenizer.convert_ids_to_tokens(tokens)
     words = []
     current_word_tokens = []
@@ -165,7 +162,6 @@ def find_alignment(
 
     for i, (tok_id, piece) in enumerate(zip(tokens, pieces)):
         if piece.startswith("\u2581") and current_word_tokens:
-            # Decode the accumulated tokens as a group for proper text
             word_text = tokenizer.decode(current_text_tokens)
             words.append((word_text, list(current_word_tokens)))
             current_word_tokens = []
@@ -178,20 +174,17 @@ def find_alignment(
         words.append((word_text, list(current_word_tokens)))
 
     # Map token indices to frame indices via DTW path
-    # For each token index, find the frame it aligns to
     jumps = np.pad(np.diff(text_indices), (1, 0), constant_values=1).astype(bool)
     jump_times = time_indices[jumps]
 
     # Build word timings
     result = []
-    token_idx = 0
     for word_text, word_tok_indices in words:
         if not word_tok_indices:
             continue
         first_tok = word_tok_indices[0]
         last_tok = word_tok_indices[-1]
 
-        # Find frame range for this word's tokens
         if first_tok < len(jump_times):
             start_frame = jump_times[first_tok]
         else:
@@ -206,7 +199,10 @@ def find_alignment(
         start_time = time_offset + float(start_frame) * FRAME_DURATION_S
         end_time = time_offset + float(end_frame) * FRAME_DURATION_S
 
-        avg_prob = float(np.mean([token_probs[i] for i in word_tok_indices]))
+        # Average token probability for this word
+        word_probs = [token_probs[i] for i in word_tok_indices if i < len(token_probs)]
+        avg_prob = float(np.mean(word_probs)) if word_probs else 1.0
+
         result.append(WordTiming(
             word=word_text.strip(),
             tokens=[tokens[i] for i in word_tok_indices],
@@ -214,5 +210,20 @@ def find_alignment(
             end=round(end_time, 3),
             probability=round(avg_prob, 4),
         ))
+
+    # Fix overlapping word boundaries by splitting at midpoints
+    for i in range(1, len(result)):
+        prev = result[i - 1]
+        curr = result[i]
+        if prev.end > curr.start:
+            mid = round((prev.end + curr.start) / 2, 3)
+            result[i - 1] = WordTiming(
+                word=prev.word, tokens=prev.tokens,
+                start=prev.start, end=mid, probability=prev.probability,
+            )
+            result[i] = WordTiming(
+                word=curr.word, tokens=curr.tokens,
+                start=mid, end=curr.end, probability=curr.probability,
+            )
 
     return result

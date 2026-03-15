@@ -658,6 +658,7 @@ class Model(nn.Module):
         tokens = [cfg.decoder_start_token_id]
         cache = None
         cross_qk_per_step = []
+        token_probs = []
 
         for _ in range(max_tokens):
             tok = mx.array([[tokens[-1]]], dtype=mx.int32)
@@ -669,7 +670,10 @@ class Model(nn.Module):
                 cross_qk_per_step.append(cross_qk)
 
             logits = self._get_logits(hidden[:, -1, :])
+            probs = mx.softmax(logits, axis=-1)
             nt = int(logits.argmax())
+            mx.eval(probs)
+            token_probs.append(float(probs.reshape(-1)[nt]))
             if nt == cfg.eos_token_id:
                 break
             tokens.append(nt)
@@ -682,6 +686,7 @@ class Model(nn.Module):
         word_timings = find_alignment(
             cross_qk_per_step, gen, self._tokenizer, num_frames,
             time_offset=time_offset,
+            token_probs=token_probs,
         )
 
         # Build segments with word-level detail
