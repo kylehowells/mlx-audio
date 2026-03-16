@@ -539,36 +539,22 @@ class Model(nn.Module):
     #  Offline (batch) generation
     # ===================================================================
 
-    def generate(self, audio, *, max_tokens: int = 500, temperature: float = 0.0,
-                 verbose: bool = False, stream: bool = False,
-                 dtype: mx.Dtype = mx.float32, **kwargs) -> STTOutput:
-        for k in ("generation_stream", "language", "source_lang", "target_lang"):
-            kwargs.pop(k, None)
-        start = time.time()
+    def _generate_chunk(self, audio: mx.array, max_tokens: int, temperature: float) -> Tuple[str, int]:
+        """Transcribe a single audio chunk. Returns (text, num_tokens)."""
+        if audio.ndim == 1:
+            audio = audio[None, :]
 
-        if isinstance(audio, (str, Path)):
-            from mlx_audio.stt.utils import load_audio
-            audio = load_audio(str(audio), sr=self.sample_rate, dtype=dtype)
-        elif not isinstance(audio, mx.array):
-            audio = mx.array(audio)
-        if audio.dtype != dtype:
-            audio = audio.astype(dtype)
-
-        # Encode (fused: single eval for entire encode pipeline)
         features = self.encoder.embedder(audio)
         encoded = self.encoder(features)
         memory = self.decoder.prepare_memory(encoded)
         mx.eval(memory)
 
-        # Limit tokens by audio duration
         dur = audio.shape[-1] / self.sample_rate
-        max_tokens = min(max_tokens, int(math.ceil(dur * self.config.max_tokens_per_second)))
+        chunk_max = min(max_tokens, int(math.ceil(dur * self.config.max_tokens_per_second)))
 
-        # Decode (async eval: pipeline GPU compute with Python)
         tokens = [self.config.decoder_start_token_id]
         cache = None
 
-        # First token (sync to prime the cache)
         tok = mx.array([[tokens[-1]]], dtype=mx.int32)
         hidden, cache, _ = self.decoder(tok, memory, cache=cache)
         logits = self._get_logits(hidden[:, -1, :])
@@ -578,7 +564,7 @@ class Model(nn.Module):
             next_tok_arr = logits.argmax()
         mx.eval(next_tok_arr)
 
-        for _ in range(max_tokens - 1):
+        for _ in range(chunk_max - 1):
             nt = int(next_tok_arr)
             if nt == self.config.eos_token_id:
                 break
@@ -592,25 +578,62 @@ class Model(nn.Module):
                 next_tok_arr = logits.argmax()
             mx.async_eval(next_tok_arr)
 
-        # Collect final token
         nt = int(next_tok_arr)
         if nt != self.config.eos_token_id:
             tokens.append(nt)
 
         gen = tokens[1:]
-        text = self._decode_tokens(gen)
+        return self._decode_tokens(gen), len(gen)
+
+    def generate(self, audio, *, max_tokens: int = 500, temperature: float = 0.0,
+                 verbose: bool = False, stream: bool = False,
+                 chunk_duration: float = 30.0,
+                 dtype: mx.Dtype = mx.float32, **kwargs) -> STTOutput:
+        """
+        Transcribe audio of any length.
+
+        Long audio is automatically split into ``chunk_duration``-second
+        segments to avoid GPU memory exhaustion.
+        """
+        for k in ("generation_stream", "language", "source_lang", "target_lang"):
+            kwargs.pop(k, None)
+        start = time.time()
+
+        if isinstance(audio, (str, Path)):
+            from mlx_audio.stt.utils import load_audio
+            audio = load_audio(str(audio), sr=self.sample_rate, dtype=dtype)
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
+        if audio.dtype != dtype:
+            audio = audio.astype(dtype)
+
+        dur = audio.shape[-1] / self.sample_rate
+        chunk_samples = int(chunk_duration * self.sample_rate)
+        total_samples = audio.shape[-1]
+
+        all_text = []
+        total_gen = 0
+
+        for offset in range(0, total_samples, chunk_samples):
+            end = min(offset + chunk_samples, total_samples)
+            chunk = audio[offset:end] if audio.ndim == 1 else audio[:, offset:end]
+            text, n_tok = self._generate_chunk(chunk, max_tokens, temperature)
+            all_text.append(text)
+            total_gen += n_tok
+
+        text = " ".join(all_text)
         elapsed = time.time() - start
         if verbose:
-            print(f"Generated {len(gen)} tokens in {elapsed:.2f}s")
+            print(f"Generated {total_gen} tokens in {elapsed:.2f}s")
             print(f"Text: {text}")
 
         return STTOutput(
             text=text.strip(),
             segments=[{"text": text.strip(), "start": 0.0, "end": dur}],
-            prompt_tokens=1, generation_tokens=len(gen),
-            total_tokens=1 + len(gen), total_time=elapsed,
+            prompt_tokens=1, generation_tokens=total_gen,
+            total_tokens=1 + total_gen, total_time=elapsed,
             prompt_tps=1 / elapsed if elapsed else 0,
-            generation_tps=len(gen) / elapsed if elapsed else 0,
+            generation_tps=total_gen / elapsed if elapsed else 0,
         )
 
     # ===================================================================
