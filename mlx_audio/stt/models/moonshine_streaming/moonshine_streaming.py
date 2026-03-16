@@ -539,61 +539,17 @@ class Model(nn.Module):
     #  Offline (batch) generation
     # ===================================================================
 
-    def _generate_chunk(self, audio: mx.array, max_tokens: int, temperature: float) -> Tuple[str, int]:
-        """Transcribe a single audio chunk. Returns (text, num_tokens)."""
-        if audio.ndim == 1:
-            audio = audio[None, :]
-
-        features = self.encoder.embedder(audio)
-        encoded = self.encoder(features)
-        memory = self.decoder.prepare_memory(encoded)
-        mx.eval(memory)
-
-        dur = audio.shape[-1] / self.sample_rate
-        chunk_max = min(max_tokens, int(math.ceil(dur * self.config.max_tokens_per_second)))
-
-        tokens = [self.config.decoder_start_token_id]
-        cache = None
-
-        tok = mx.array([[tokens[-1]]], dtype=mx.int32)
-        hidden, cache, _ = self.decoder(tok, memory, cache=cache)
-        logits = self._get_logits(hidden[:, -1, :])
-        if temperature > 0:
-            next_tok_arr = mx.random.categorical(logits / temperature)
-        else:
-            next_tok_arr = logits.argmax()
-        mx.eval(next_tok_arr)
-
-        for _ in range(chunk_max - 1):
-            nt = int(next_tok_arr)
-            if nt == self.config.eos_token_id:
-                break
-            tokens.append(nt)
-            tok = mx.array([[nt]], dtype=mx.int32)
-            hidden, cache, _ = self.decoder(tok, memory, cache=cache)
-            logits = self._get_logits(hidden[:, -1, :])
-            if temperature > 0:
-                next_tok_arr = mx.random.categorical(logits / temperature)
-            else:
-                next_tok_arr = logits.argmax()
-            mx.async_eval(next_tok_arr)
-
-        nt = int(next_tok_arr)
-        if nt != self.config.eos_token_id:
-            tokens.append(nt)
-
-        gen = tokens[1:]
-        return self._decode_tokens(gen), len(gen)
-
     def generate(self, audio, *, max_tokens: int = 500, temperature: float = 0.0,
                  verbose: bool = False, stream: bool = False,
-                 chunk_duration: float = 30.0,
                  dtype: mx.Dtype = mx.float32, **kwargs) -> STTOutput:
         """
-        Transcribe audio of any length.
+        Transcribe audio of any length using the streaming pipeline.
 
-        Long audio is automatically split into ``chunk_duration``-second
-        segments to avoid GPU memory exhaustion.
+        Uses the streaming encoder internally so there is no fixed context
+        window (unlike Whisper's 30-second limit).  Audio is fed through
+        the frontend in small chunks, the encoder processes incrementally
+        with its sliding-window attention, and the decoder transcribes
+        the accumulated memory.
         """
         for k in ("generation_stream", "language", "source_lang", "target_lang"):
             kwargs.pop(k, None)
@@ -608,32 +564,75 @@ class Model(nn.Module):
             audio = audio.astype(dtype)
 
         dur = audio.shape[-1] / self.sample_rate
-        chunk_samples = int(chunk_duration * self.sample_rate)
-        total_samples = audio.shape[-1]
+
+        # Use the streaming pipeline internally.  Audio is fed through
+        # the frontend incrementally so the encoder processes with its
+        # sliding-window attention — no fixed 30-second context window.
+        #
+        # The decoder has a max_seq_len (448 tokens), so we segment the
+        # decoding at regular intervals: every ``decode_interval`` seconds
+        # of audio, we encode accumulated features and decode a segment,
+        # then reset memory for the next segment.
+        FRONTEND_CHUNK = 1280  # 80ms at 16kHz
+        DECODE_INTERVAL = 30 * self.sample_rate  # decode every ~30s of audio
+
+        total_samples = audio.shape[-1] if audio.ndim == 1 else audio.shape[-1]
+        flat_audio = audio.reshape(-1) if audio.ndim > 1 else audio
 
         all_text = []
         total_gen = 0
+        state = self.create_stream()
+        state = self.start_stream(state)
+        samples_fed = 0
 
-        for offset in range(0, total_samples, chunk_samples):
-            end = min(offset + chunk_samples, total_samples)
-            chunk = audio[offset:end] if audio.ndim == 1 else audio[:, offset:end]
-            text, n_tok = self._generate_chunk(chunk, max_tokens, temperature)
+        for offset in range(0, total_samples, FRONTEND_CHUNK):
+            end = min(offset + FRONTEND_CHUNK, total_samples)
+            state = self.add_audio(state, flat_audio[offset:end])
+            samples_fed += (end - offset)
+
+            # When enough audio has accumulated, encode and decode a segment
+            if samples_fed >= DECODE_INTERVAL:
+                text, state = self.transcribe(
+                    state, is_final=False, max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                if text:
+                    all_text.append(text)
+                    total_gen += len(text.split())
+                # Clear memory for the next decode segment, but keep
+                # frontend and encoder state so context is preserved.
+                state.memory = None
+                state.memory_len = 0
+                state.encoder_frames_emitted = 0
+                state.pos_offset = 0
+                state.accumulated_features = None
+                state.accumulated_feature_count = 0
+                samples_fed = 0
+
+        # Final segment
+        state = self.stop_stream(state)
+        text, state = self.transcribe(
+            state, is_final=True, max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if text:
             all_text.append(text)
-            total_gen += n_tok
+            total_gen += len(text.split())
 
         text = " ".join(all_text)
+        gen_tokens = total_gen
         elapsed = time.time() - start
         if verbose:
-            print(f"Generated {total_gen} tokens in {elapsed:.2f}s")
+            print(f"Generated in {elapsed:.2f}s")
             print(f"Text: {text}")
 
         return STTOutput(
             text=text.strip(),
             segments=[{"text": text.strip(), "start": 0.0, "end": dur}],
-            prompt_tokens=1, generation_tokens=total_gen,
-            total_tokens=1 + total_gen, total_time=elapsed,
+            prompt_tokens=1, generation_tokens=gen_tokens,
+            total_tokens=1 + gen_tokens, total_time=elapsed,
             prompt_tps=1 / elapsed if elapsed else 0,
-            generation_tps=total_gen / elapsed if elapsed else 0,
+            generation_tps=gen_tokens / elapsed if elapsed else 0,
         )
 
     # ===================================================================
